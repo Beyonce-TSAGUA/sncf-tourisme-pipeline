@@ -205,3 +205,29 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# Credentials - NE JAMAIS COMMITTER
+.env
+
+# Données brutes locales
+data/static/*.csv
+data/static/*.parquet
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs Airflow
+logs/
+
+# Docker volumes locaux
+minio_data/
+postgres_data/
