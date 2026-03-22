@@ -1,5 +1,5 @@
-# Producer Kafka
-kafka-python==2.0.2
+# Producer Kafka (fork compatible Python 3.12)
+kafka-python-ng==2.2.3
 
 # Appels API
 requests==2.31.0
