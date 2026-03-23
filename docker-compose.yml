@@ -17,7 +17,6 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
-    - ./spark_jobs:/opt/airflow/spark_jobs
   networks:
     - pipeline_network
   depends_on:
@@ -103,29 +102,6 @@ services:
       "
     networks:
       - pipeline_network
-
-# ── 5. SPARK ──────────────────────────────────────────────
-  spark:
-    image: apache/spark:3.5.0
-    container_name: spark
-    environment:
-      SPARK_MODE: master
-      MINIO_ENDPOINT: http://minio:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
-    ports:
-      - "4040:4040"
-      - "7077:7077"
-      - "8888:8888"
-    volumes:
-      - ./spark_jobs:/opt/spark_jobs
-    networks:
-      - pipeline_network
-    depends_on:
-      minio:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
 
   # ── 6. POSTGRESQL (métastore Airflow) ─────────────────────
   postgres:
