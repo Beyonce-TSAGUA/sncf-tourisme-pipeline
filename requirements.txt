@@ -20,3 +20,5 @@ cryptography==42.0.8
 
 # Spark local
 pyspark==3.5.0
+
+matplotlib==3.8.0

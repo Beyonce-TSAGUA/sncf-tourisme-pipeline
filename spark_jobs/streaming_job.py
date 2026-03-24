@@ -18,9 +18,10 @@ Topics consommés :
 
 Transformations appliquées :
     - Parsing JSON des messages Kafka
-    - Nettoyage et typage des colonnes
-    - Enrichissement (coordonnées GPS, calcul CO2, geo_cell)
-    - Écriture Parquet compressé Snappy dans MinIO
+    - Nettoyage : doublons, nulls, valeurs négatives, taux impossibles
+    - Typage fort : Long, Integer, Double, Date, Boolean
+    - Enrichissement : geo_cell, évolution COVID, CO2, taux calculés
+    - Écriture Parquet mode overwrite dans MinIO
 
 Utilisation :
     python spark_jobs/streaming_job.py
@@ -55,7 +56,7 @@ MINIO_PASSWORD = os.getenv("MINIO_ROOT_PASSWORD", "password123")
 # Chemin de base dans MinIO pour la couche Silver
 SILVER_BASE = "s3a://silver"
 
-# Checkpoint local Windows — évite le problème NativeIO$Windows
+# Checkpoint local Windows
 CHECKPOINT_BASE = "file:///C:/tmp/spark_checkpoints"
 
 # Topics Kafka à consommer
@@ -85,15 +86,15 @@ SCHEMA_GARES = StructType([
 ])
 
 SCHEMA_FREQUENTATION = StructType([
-    StructField("nom_gare",              StringType(),  True),
-    StructField("code_uic_complet",      StringType(),  True),
-    StructField("code_postal",           StringType(),  True),
-    StructField("segmentation_drg",      StringType(),  True),
-    StructField("total_voyageurs_2024",  DoubleType(),  True),
-    StructField("total_voyageurs_2023",  DoubleType(),  True),
-    StructField("total_voyageurs_2022",  DoubleType(),  True),
-    StructField("total_voyageurs_2019",  DoubleType(),  True),
-    StructField("ingested_at",           StringType(),  True),
+    StructField("nom_gare",             StringType(),  True),
+    StructField("code_uic_complet",     StringType(),  True),
+    StructField("code_postal",          StringType(),  True),
+    StructField("segmentation_drg",     StringType(),  True),
+    StructField("total_voyageurs_2024", DoubleType(),  True),
+    StructField("total_voyageurs_2023", DoubleType(),  True),
+    StructField("total_voyageurs_2022", DoubleType(),  True),
+    StructField("total_voyageurs_2019", DoubleType(),  True),
+    StructField("ingested_at",          StringType(),  True),
 ])
 
 SCHEMA_TGVMAX = StructType([
@@ -136,11 +137,9 @@ def creer_spark_session() -> SparkSession:
     Crée et configure la session Spark avec :
     - Connecteur Kafka (lecture streaming)
     - Connecteur S3A (écriture MinIO)
-    - Hadoop AWS (authentification MinIO)
-    - Blocs S3A en mémoire (évite NativeIO$Windows)
-    - Checkpoint local (évite NativeIO$Windows)
+    - Blocs S3A en mémoire (évite NativeIO Windows)
+    - Checkpoint local (évite NativeIO Windows)
     """
-    # Fix Windows : HADOOP_HOME requis par Spark
     os.environ["HADOOP_HOME"] = "C:\\hadoop"
     os.environ["PATH"] = os.environ["PATH"] + ";C:\\hadoop\\bin"
 
@@ -149,32 +148,28 @@ def creer_spark_session() -> SparkSession:
     spark = (
         SparkSession.builder
         .appName("SNCF-Tourisme-Streaming")
-        # ── Packages Maven nécessaires ──────────────────────────
         .config(
             "spark.jars.packages",
             "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,"
             "org.apache.hadoop:hadoop-aws:3.3.4,"
             "com.amazonaws:aws-java-sdk-bundle:1.12.262"
         )
-        # ── Configuration MinIO (S3-compatible) ─────────────────
+        # ── Configuration MinIO ──────────────────────────────────
         .config("spark.hadoop.fs.s3a.endpoint",           MINIO_ENDPOINT)
         .config("spark.hadoop.fs.s3a.access.key",         MINIO_USER)
         .config("spark.hadoop.fs.s3a.secret.key",         MINIO_PASSWORD)
         .config("spark.hadoop.fs.s3a.path.style.access",  "true")
         .config("spark.hadoop.fs.s3a.impl",
                 "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        # ── Fix NativeIO Windows : blocs S3A en mémoire ─────────
-        # Sans ça, S3A écrit des fichiers temporaires sur le disque
-        # local via NativeIO qui plante sur Windows
+        # ── Fix NativeIO Windows ─────────────────────────────────
         .config("spark.hadoop.fs.s3a.fast.upload",        "true")
         .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")
         .config("spark.hadoop.fs.s3a.multipart.size",     "67108864")
-        # ── Fix filesystem local Windows ─────────────────────────
         .config("spark.hadoop.fs.file.impl",
                 "org.apache.hadoop.fs.LocalFileSystem")
         .config("spark.hadoop.fs.file.impl.disable.cache", "true")
         .config("spark.sql.streaming.checkpointFileManagerClass",
-        "org.apache.spark.sql.execution.streaming.FileSystemBasedCheckpointFileManager")
+                "org.apache.spark.sql.execution.streaming.FileSystemBasedCheckpointFileManager")
         # ── Optimisations ────────────────────────────────────────
         .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
@@ -186,13 +181,13 @@ def creer_spark_session() -> SparkSession:
 
 
 # ─────────────────────────────────────────────────────────────────
-# FONCTION GÉNÉRIQUE DE LECTURE KAFKA
+# LECTURE KAFKA
 # ─────────────────────────────────────────────────────────────────
 
 def lire_topic_kafka(spark: SparkSession, topic: str):
     """
     Lit un topic Kafka en mode streaming.
-    Retourne un DataFrame streaming avec colonne 'json_str'.
+    Retourne un DataFrame avec colonne 'json_str'.
     """
     return (
         spark.readStream
@@ -207,13 +202,18 @@ def lire_topic_kafka(spark: SparkSession, topic: str):
 
 
 # ─────────────────────────────────────────────────────────────────
-# TRANSFORMATIONS PAR DATASET
+# TRANSFORMATIONS SILVER
 # ─────────────────────────────────────────────────────────────────
 
 def transformer_gares(df_raw):
     """
-    Parse les gares, extrait lat/lon, calcule geo_cell.
-    geo_cell = clé spatiale ~10km pour jointures rapides.
+    Nettoyage Silver des gares :
+    - Déduplication sur codes_uic
+    - Suppression des gares sans GPS
+    - Validation bbox France (lat 41-52, lon -5.5 à 10)
+    - Typage fort lat/lon en Double
+    - Normalisation nom en initcap
+    - Calcul geo_cell pour jointures spatiales
     """
     return (
         df_raw
@@ -224,17 +224,34 @@ def transformer_gares(df_raw):
             F.col("d.codes_uic").alias("codes_uic"),
             F.col("d.segment_drg").alias("segment_drg"),
             F.col("d.codeinsee").alias("code_insee"),
-            F.col("d.position_geographique.lat").alias("latitude"),
-            F.col("d.position_geographique.lon").alias("longitude"),
+            F.col("d.position_geographique.lat").cast("double").alias("latitude"),
+            F.col("d.position_geographique.lon").cast("double").alias("longitude"),
             F.col("d.ingested_at").alias("ingested_at"),
         )
-        .filter(F.col("latitude").isNotNull() & F.col("longitude").isNotNull())
+        # Supprime les nulls critiques
+        .filter(
+            F.col("latitude").isNotNull() &
+            F.col("longitude").isNotNull() &
+            F.col("codes_uic").isNotNull()
+        )
+        # Validation bbox France
+        .filter(
+            (F.col("latitude")  >= 41)   & (F.col("latitude")  <= 52) &
+            (F.col("longitude") >= -5.5) & (F.col("longitude") <= 10)
+        )
+        # Déduplication sur la clé métier
+        .dropDuplicates(["codes_uic"])
+        # Normalisation du nom
+        .withColumn("nom_gare", F.initcap(F.col("nom_gare")))
+        # Geo cell pour jointures spatiales ~10km
         .withColumn("lat_grid", F.round("latitude",  2))
         .withColumn("lon_grid", F.round("longitude", 2))
         .withColumn("geo_cell",
-            F.concat(F.col("lat_grid").cast("string"),
-                     F.lit("_"),
-                     F.col("lon_grid").cast("string"))
+            F.concat(
+                F.col("lat_grid").cast("string"),
+                F.lit("_"),
+                F.col("lon_grid").cast("string")
+            )
         )
         .withColumn("processed_at", F.current_timestamp())
     )
@@ -242,8 +259,13 @@ def transformer_gares(df_raw):
 
 def transformer_frequentation(df_raw):
     """
-    Parse la fréquentation, calcule l'évolution 2019→2024.
-    Indicateur clé : récupération post-COVID.
+    Nettoyage Silver de la fréquentation :
+    - Déduplication sur code_uic
+    - Suppression des nulls critiques
+    - Remplacement valeurs négatives par 0
+    - Remplacement nulls voyageurs par 0
+    - Typage fort en Long (entier 64 bits)
+    - Calcul évolution COVID 2019→2024
     """
     return (
         df_raw
@@ -253,12 +275,39 @@ def transformer_frequentation(df_raw):
             F.col("d.code_uic_complet").alias("code_uic"),
             F.col("d.code_postal").alias("code_postal"),
             F.col("d.segmentation_drg").alias("segment_drg"),
-            F.col("d.total_voyageurs_2024").alias("voyageurs_2024"),
-            F.col("d.total_voyageurs_2023").alias("voyageurs_2023"),
-            F.col("d.total_voyageurs_2022").alias("voyageurs_2022"),
-            F.col("d.total_voyageurs_2019").alias("voyageurs_2019"),
+            F.col("d.total_voyageurs_2024").cast("long").alias("voyageurs_2024"),
+            F.col("d.total_voyageurs_2023").cast("long").alias("voyageurs_2023"),
+            F.col("d.total_voyageurs_2022").cast("long").alias("voyageurs_2022"),
+            F.col("d.total_voyageurs_2019").cast("long").alias("voyageurs_2019"),
             F.col("d.ingested_at").alias("ingested_at"),
         )
+        # Supprime les nulls critiques
+        .filter(
+            F.col("nom_gare").isNotNull() &
+            F.col("code_uic").isNotNull()
+        )
+        # Déduplication sur la clé métier
+        .dropDuplicates(["code_uic"])
+        # Normalisation nom
+        .withColumn("nom_gare", F.initcap(F.col("nom_gare")))
+        # Remplace négatifs et nulls par 0
+        .withColumn("voyageurs_2024",
+            F.when(F.col("voyageurs_2024") < 0, F.lit(0))
+            .otherwise(F.coalesce(F.col("voyageurs_2024"), F.lit(0)))
+        )
+        .withColumn("voyageurs_2023",
+            F.when(F.col("voyageurs_2023") < 0, F.lit(0))
+            .otherwise(F.coalesce(F.col("voyageurs_2023"), F.lit(0)))
+        )
+        .withColumn("voyageurs_2022",
+            F.when(F.col("voyageurs_2022") < 0, F.lit(0))
+            .otherwise(F.coalesce(F.col("voyageurs_2022"), F.lit(0)))
+        )
+        .withColumn("voyageurs_2019",
+            F.when(F.col("voyageurs_2019") < 0, F.lit(0))
+            .otherwise(F.coalesce(F.col("voyageurs_2019"), F.lit(0)))
+        )
+        # Évolution COVID uniquement si 2019 > 0
         .withColumn("evolution_pct_2019_2024",
             F.when(
                 F.col("voyageurs_2019") > 0,
@@ -267,7 +316,7 @@ def transformer_frequentation(df_raw):
                     / F.col("voyageurs_2019") * 100,
                     1
                 )
-            ).otherwise(None)
+            ).otherwise(F.lit(None).cast("double"))
         )
         .withColumn("processed_at", F.current_timestamp())
     )
@@ -275,18 +324,21 @@ def transformer_frequentation(df_raw):
 
 def transformer_tgvmax(df_raw):
     """
-    Parse les disponibilités TGV MAX.
-    Calcule est_disponible, OD, jour semaine, weekend, CO2 économisé.
-    Facteurs ADEME : voiture=192 gCO2/km, TGV=2.5 gCO2/km.
+    Nettoyage Silver des disponibilités TGV MAX :
+    - Déduplication sur train_no + date + origine + destination
+    - Suppression des nulls critiques
+    - Garde uniquement les dates futures
+    - Typage date en DateType et booléen
+    - Calcul jour semaine, weekend, CO2 économisé
     """
-    CO2_VOITURE = 192.0
-    CO2_TRAIN   = 2.5
+    CO2_VOITURE = 192.0  # gCO2/km (voiture thermique — ADEME)
+    CO2_TRAIN   = 2.5    # gCO2/km (TGV électrique — ADEME)
 
     return (
         df_raw
         .select(F.from_json("json_str", SCHEMA_TGVMAX).alias("d"))
         .select(
-            F.col("d.date").alias("date_depart"),
+            F.to_date(F.col("d.date"), "yyyy-MM-dd").alias("date_depart"),
             F.col("d.train_no").alias("train_no"),
             F.col("d.axe").alias("axe"),
             F.col("d.origine").alias("origine"),
@@ -298,18 +350,34 @@ def transformer_tgvmax(df_raw):
             F.col("d.od_happy_card").alias("od_happy_card"),
             F.col("d.ingested_at").alias("ingested_at"),
         )
+        # Supprime les nulls critiques
+        .filter(
+            F.col("train_no").isNotNull() &
+            F.col("date_depart").isNotNull() &
+            F.col("origine").isNotNull() &
+            F.col("destination").isNotNull()
+        )
+        # Garde uniquement les dates futures ou aujourd'hui
+        .filter(F.col("date_depart") >= F.current_date())
+        # Déduplication sur la clé métier
+        .dropDuplicates(["train_no", "date_depart", "origine", "destination"])
+        # Disponibilité en booléen
         .withColumn("est_disponible",
             F.col("od_happy_card") == "OUI"
         )
+        # Paire Origine-Destination
         .withColumn("od",
             F.concat(F.col("origine"), F.lit("->"), F.col("destination"))
         )
+        # Jour de semaine (0=lundi, 6=dimanche)
         .withColumn("jour_semaine",
-            F.dayofweek(F.to_date("date_depart", "yyyy-MM-dd")) - 2
+            F.dayofweek(F.col("date_depart")) - 2
         )
+        # Flag weekend
         .withColumn("est_weekend",
             F.col("jour_semaine").isin([5, 6])
         )
+        # CO2 économisé vs voiture (Bordeaux-Paris ~580km)
         .withColumn("co2_economise_kg",
             F.round(
                 F.lit(580.0) * (F.lit(CO2_VOITURE) - F.lit(CO2_TRAIN)) / 1000,
@@ -322,8 +390,15 @@ def transformer_tgvmax(df_raw):
 
 def transformer_regularite(df_raw):
     """
-    Parse la régularité mensuelle TGV.
-    Calcule taux de régularité et taux d'annulation.
+    Nettoyage Silver de la régularité :
+    - Déduplication sur periode + gare_depart + gare_arrivee
+    - Suppression des nulls critiques
+    - Suppression des lignes avec nb_train_prevu = 0
+    - Typage fort Integer et Double
+    - Remplacement nulls compteurs par 0
+    - Calcul taux régularité et annulation
+    - Validation : taux entre 0 et 100
+    - Extraction année et mois
     """
     return (
         df_raw
@@ -332,39 +407,57 @@ def transformer_regularite(df_raw):
             F.col("d.date").alias("periode"),
             F.col("d.gare_depart").alias("gare_depart"),
             F.col("d.gare_arrivee").alias("gare_arrivee"),
-            F.col("d.nb_train_prevu").alias("nb_train_prevu"),
-            F.col("d.nb_annulation").alias("nb_annulation"),
-            F.col("d.nb_train_retard_arrivee").alias("nb_train_retard"),
-            F.col("d.retard_moyen_arrivee").alias("retard_moyen_min"),
-            F.col("d.nb_train_retard_sup_15").alias("nb_retard_sup_15"),
-            F.col("d.nb_train_retard_sup_30").alias("nb_retard_sup_30"),
-            F.col("d.prct_cause_externe").alias("pct_cause_externe"),
-            F.col("d.prct_cause_infra").alias("pct_cause_infra"),
-            F.col("d.prct_cause_materiel_roulant").alias("pct_cause_materiel"),
+            F.col("d.nb_train_prevu").cast("integer").alias("nb_train_prevu"),
+            F.col("d.nb_annulation").cast("integer").alias("nb_annulation"),
+            F.col("d.nb_train_retard_arrivee").cast("integer").alias("nb_train_retard"),
+            F.col("d.retard_moyen_arrivee").cast("double").alias("retard_moyen_min"),
+            F.col("d.nb_train_retard_sup_15").cast("integer").alias("nb_retard_sup_15"),
+            F.col("d.nb_train_retard_sup_30").cast("integer").alias("nb_retard_sup_30"),
+            F.col("d.prct_cause_externe").cast("double").alias("pct_cause_externe"),
+            F.col("d.prct_cause_infra").cast("double").alias("pct_cause_infra"),
+            F.col("d.prct_cause_materiel_roulant").cast("double").alias("pct_cause_materiel"),
             F.col("d.ingested_at").alias("ingested_at"),
         )
+        # Supprime les nulls critiques
+        .filter(
+            F.col("periode").isNotNull() &
+            F.col("gare_depart").isNotNull() &
+            F.col("nb_train_prevu").isNotNull()
+        )
+        # Supprime les lignes sans trains prévus (évite division par zéro)
+        .filter(F.col("nb_train_prevu") > 0)
+        # Déduplication sur la clé métier
+        .dropDuplicates(["periode", "gare_depart", "gare_arrivee"])
+        # Remplace les nulls des compteurs par 0
+        .fillna(0, subset=[
+            "nb_annulation", "nb_train_retard",
+            "nb_retard_sup_15", "nb_retard_sup_30"
+        ])
+        # Taux de régularité
         .withColumn("taux_regularite_pct",
-            F.when(
-                F.col("nb_train_prevu") > 0,
-                F.round(
-                    (F.col("nb_train_prevu")
-                     - F.col("nb_annulation")
-                     - F.col("nb_train_retard"))
-                    / F.col("nb_train_prevu") * 100,
-                    1
-                )
-            ).otherwise(None)
+            F.round(
+                (F.col("nb_train_prevu")
+                 - F.col("nb_annulation")
+                 - F.col("nb_train_retard"))
+                / F.col("nb_train_prevu") * 100,
+                1
+            )
         )
+        # Validation : supprime les taux impossibles
+        .filter(
+            (F.col("taux_regularite_pct") >= 0) &
+            (F.col("taux_regularite_pct") <= 100)
+        )
+        # Taux d'annulation
         .withColumn("taux_annulation_pct",
-            F.when(
-                F.col("nb_train_prevu") > 0,
-                F.round(
-                    F.col("nb_annulation")
-                    / F.col("nb_train_prevu") * 100,
-                    1
-                )
-            ).otherwise(None)
+            F.round(
+                F.col("nb_annulation") / F.col("nb_train_prevu") * 100,
+                1
+            )
         )
+        # Extraction année et mois pour les visuels temporels
+        .withColumn("annee", F.col("periode").substr(1, 4))
+        .withColumn("mois",  F.col("periode").substr(6, 2))
         .withColumn("processed_at", F.current_timestamp())
     )
 
@@ -373,24 +466,31 @@ def transformer_regularite(df_raw):
 # ÉCRITURE VERS MINIO (FORMAT PARQUET)
 # ─────────────────────────────────────────────────────────────────
 
-def ecrire_silver(df, chemin: str, checkpoint: str, partition_col: str = None):
+def ecrire_silver(df, chemin: str, checkpoint: str,
+                  partition_col: str = None, mode: str = "overwrite"):
     """
     Écrit un DataFrame streaming en Parquet dans MinIO via foreachBatch.
-    Plus robuste sur Windows que le writer Parquet natif.
 
-    foreachBatch reçoit chaque micro-batch comme un DataFrame statique
-    → on peut utiliser le writer Parquet classique sans problème NativeIO.
+    mode='overwrite' : écrase les données à chaque batch
+                       → garantit des données propres sans doublons
+                       → adapté aux données quasi-statiques
+
+    mode='append'    : accumule les données batch après batch
+                       → adapté uniquement si on veut l'historique
+
+    foreachBatch est plus robuste sur Windows que le writer natif.
     """
     def write_batch(batch_df, batch_id):
-        # Ne rien faire si le batch est vide
         if batch_df.isEmpty():
             return
+        # Déduplication finale de sécurité
+        batch_df = batch_df.dropDuplicates()
         count = batch_df.count()
-        writer = batch_df.write.format("parquet").mode("append")
+        writer = batch_df.write.format("parquet").mode(mode)
         if partition_col:
             writer = writer.partitionBy(partition_col)
         writer.save(chemin)
-        print(f"  Batch {batch_id} → {chemin} ({count} lignes)")
+        print(f"  Batch {batch_id} → {chemin} ({count} lignes, mode={mode})")
 
     return (
         df.writeStream
@@ -426,30 +526,34 @@ def main():
     silver_tgvmax        = transformer_tgvmax(raw_tgvmax)
     silver_regularite    = transformer_regularite(raw_regularite)
 
-    # ── Écriture dans MinIO ──────────────────────────────────────
+    # ── Écriture dans MinIO (mode overwrite = pas de doublons) ───
     print("Démarrage des streams d'écriture vers MinIO...")
 
     q1 = ecrire_silver(
         silver_gares,
         chemin     = f"{SILVER_BASE}/gares",
-        checkpoint = f"{CHECKPOINT_BASE}/gares"
+        checkpoint = f"{CHECKPOINT_BASE}/gares",
+        mode       = "overwrite"
     )
     q2 = ecrire_silver(
         silver_frequentation,
         chemin     = f"{SILVER_BASE}/frequentation",
-        checkpoint = f"{CHECKPOINT_BASE}/frequentation"
+        checkpoint = f"{CHECKPOINT_BASE}/frequentation",
+        mode       = "overwrite"
     )
     q3 = ecrire_silver(
         silver_tgvmax,
         chemin        = f"{SILVER_BASE}/tgvmax",
         checkpoint    = f"{CHECKPOINT_BASE}/tgvmax",
-        partition_col = "date_depart"
+        partition_col = "date_depart",
+        mode          = "overwrite"
     )
     q4 = ecrire_silver(
         silver_regularite,
         chemin        = f"{SILVER_BASE}/regularite",
         checkpoint    = f"{CHECKPOINT_BASE}/regularite",
-        partition_col = "periode"
+        partition_col = "periode",
+        mode          = "overwrite"
     )
 
     print("\nStreams actifs — écriture en cours dans MinIO...")
