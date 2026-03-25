@@ -30,31 +30,18 @@ Orchestration : Apache Airflow
 
 | Source | Contenu | Type |
 |--------|---------|------|
-| API SNCF open data | Gares, horaires, fréquentation | Temps réel |
+| API SNCF open data | Gares, horaires, fréquentation, TGVmax | Temps réel |
 | DATAtourisme | POI touristiques Nouvelle-Aquitaine | Statique |
 | data.gouv.fr | Aménagements cyclables | Statique |
 | ADEME Base Carbone | Facteurs d'émission CO₂ | Statique |
 
 ## Lancer le projet
 
+Suivez les instructions contenues dans le fichier "guide_pipeline_sncf.docx" a la racine du projet.
+
 ### Prérequis
 - Docker Desktop
-- Python 3.10+
-
-### Démarrage
-```bash
-# 1. Copier et remplir les variables d'environnement
-cp .env.example .env
-
-# 2. Lancer toute l'infrastructure
-docker compose up -d
-
-# 3. Lancer le producer Kafka
-python producers/sncf_producer.py
-
-# 4. Accès aux interfaces
-# Airflow   → http://localhost:8080
-# MinIO     → http://localhost:9001
+- Python 3.12+
 ```
 
 ## Questions auxquelles répond le dashboard
